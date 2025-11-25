@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,7 +85,20 @@ type Config struct {
 	AllowedTypes oci.ArtifactTypeSlice
 	// Signature has the data needed for signature checking
 	Signature *index.Signature
+	// StartupBehavior controls what happens on the first follow invocation.
+	StartupBehavior StartupBehavior
+	// StartupMaxDelay is the maximum random delay applied before the first follow
+	// when StartupBehavior is StartupBehaviorJitter.
+	StartupMaxDelay time.Duration
 }
+
+type StartupBehavior string
+
+const (
+	StartupBehaviorSkip      StartupBehavior = "skip"
+	StartupBehaviorJitter    StartupBehavior = "jitter"
+	StartupBehaviorImmediate StartupBehavior = "immediate"
+)
 
 var (
 	isInt = regexp.MustCompile(`^(0|([1-9]\d*))$`)
@@ -131,10 +145,41 @@ func New(ref string, printer *output.Printer, conf *Config) (*Follower, error) {
 	}, nil
 }
 
+func (f *Follower) startupBehavior() StartupBehavior {
+	b := f.StartupBehavior
+	switch b {
+	case StartupBehaviorSkip, StartupBehaviorJitter, StartupBehaviorImmediate:
+		return b
+	default:
+		// Default to jitter if the value is empty or not recognized (defensive case).
+		return StartupBehaviorJitter
+	}
+}
+
 // Follow starts a goroutine that periodically checks for updates for the configured artifact.
 func (f *Follower) Follow(ctx context.Context) {
-	// At start up time of the follower we sync immediately without waiting the resync time.
-	f.follow(ctx)
+	switch f.startupBehavior() {
+	case StartupBehaviorSkip:
+		// Skip the initial follow; the first run will happen on the first scheduled resync.
+	case StartupBehaviorJitter:
+		maxDelay := f.StartupMaxDelay
+		if maxDelay > 0 {
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			// Int63n panics if argument is <= 0, guard above and add 1 to include maxDelay.
+			val := r.Int63n(maxDelay.Nanoseconds() + 1)
+			delay := time.Duration(val)
+			f.logger.Debug("Delaying first check for new artifact version", f.logger.Args("followerName", f.ref, "delay", delay))
+			if err := sleepWithContext(ctx, delay); err != nil {
+				return
+			}
+		}
+		f.follow(ctx)
+	case StartupBehaviorImmediate:
+		fallthrough
+	default:
+		// At start up time of the follower we sync immediately without waiting the resync time.
+		f.follow(ctx)
+	}
 
 	for {
 		now := time.Now()
@@ -150,6 +195,20 @@ func (f *Follower) Follow(ctx context.Context) {
 			// Start following the artifact.
 			f.follow(ctx)
 		}
+	}
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
